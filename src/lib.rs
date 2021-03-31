@@ -1,37 +1,70 @@
-extern crate dirs_next;
-extern crate mailparse;
-extern crate regex;
-extern crate toml;
-#[macro_use]
-extern crate serde_derive;
-extern crate structopt;
-#[macro_use]
-extern crate log;
-extern crate fs2;
-extern crate simplelog;
+use std::{collections::HashMap, path::Path};
 
-use fs2::*;
+use log::*;
 use mailparse::*;
 use regex::bytes::Regex as BytesRegex;
 use regex::Regex;
-use simplelog::Config as LogConfig;
-use simplelog::{LevelFilter, WriteLogger};
-use std::collections::HashMap;
+use serde_derive::Deserialize;
 use std::fmt::{Display, Formatter};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Read;
-use std::path::PathBuf;
-use structopt::StructOpt;
-use subprocess::ExitStatus::*;
 use subprocess::{Popen, PopenConfig, Redirection};
 
 #[derive(Deserialize, Clone, Debug)]
-struct Rule {
-    headers: Option<Vec<HashMap<String, String>>>,
-    body: Option<Vec<Vec<String>>>,
-    raw: Option<Vec<Vec<String>>>,
-    action: Option<Vec<Vec<String>>>,
-    filter: Option<Vec<String>>,
+pub struct Rule {
+    pub headers: Option<Vec<HashMap<String, String>>>,
+    pub body: Option<Vec<Vec<String>>>,
+    pub raw: Option<Vec<Vec<String>>>,
+    pub action: Option<Vec<Vec<String>>>,
+    pub filter: Option<Vec<String>>,
+}
+
+pub struct Job {
+    pub subprocess: Popen,
+    pub stdout: Option<Vec<u8>>,
+    pub stderr: Option<Vec<u8>>,
+}
+
+impl Job {
+    pub fn run(action: &[String], input: Option<&[u8]>) -> Job {
+        let mut p = Popen::create(
+            action,
+            PopenConfig {
+                stdin: if input.is_some() {
+                    Redirection::Pipe
+                } else {
+                    Redirection::None
+                },
+                stdout: Redirection::Pipe,
+                stderr: Redirection::Pipe,
+                ..Default::default()
+            },
+        )
+        .expect("Could not spawn child process");
+
+        let mut stdout = None;
+        let mut stderr = None;
+        if let Ok((out, err)) = p.communicate_bytes(input) {
+            stdout = out;
+            stderr = err;
+        }
+        let _ = p.wait();
+
+        Job {
+            subprocess: p,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn success(&self) -> bool {
+        self.subprocess.exit_status().map_or(false, |e| e.success())
+    }
+
+    fn found(program: String) -> bool {
+        let which = vec!["which".to_string(), program];
+        Job::run(&which, None).success()
+    }
 }
 
 impl Display for Rule {
@@ -86,78 +119,22 @@ impl Match {
     }
 }
 
-struct Job {
-    subprocess: Popen,
-    stdout: Option<Vec<u8>>,
-    stderr: Option<Vec<u8>>,
-}
-
-impl Job {
-    fn run(action: &[String], input: Option<&[u8]>) -> Job {
-        let mut p = Popen::create(
-            action,
-            PopenConfig {
-                stdin: if input.is_some() {
-                    Redirection::Pipe
-                } else {
-                    Redirection::None
-                },
-                stdout: Redirection::Pipe,
-                stderr: Redirection::Pipe,
-                ..Default::default()
-            },
-        )
-        .expect("Could not spawn child process");
-
-        let mut stdout = None;
-        let mut stderr = None;
-        if let Ok((out, err)) = p.communicate_bytes(input) {
-            stdout = out;
-            stderr = err;
-        }
-        let _ = p.wait();
-
-        Job {
-            subprocess: p,
-            stdout,
-            stderr,
-        }
-    }
-
-    fn success(&self) -> bool {
-        self.subprocess.exit_status().map_or(false, |e| e.success())
-    }
-
-    fn found(program: String) -> bool {
-        let which = vec!["which".to_string(), program];
-        Job::run(&which, None).success()
-    }
-}
-
 #[derive(Deserialize, Clone)]
-struct Config {
+pub struct Config {
     version: usize,
     rules: Vec<Rule>,
 }
 
 impl Config {
-    fn new() -> Config {
-        let mut conf = match dirs_next::home_dir() {
-            Some(path) => path,
-            _ => PathBuf::from(""),
-        };
-        conf.push(".mailproc.conf");
-        let mut f =
-            File::open(&conf).unwrap_or_else(|_| panic!("Could not open config file {:?}.", &conf));
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Config, Box<dyn std::error::Error>> {
+        let mut f = File::open(path)?;
         let mut buf = String::new();
-        f.read_to_string(&mut buf)
-            .unwrap_or_else(|_| panic!("Could not read config file: {:?}", &conf));
-        let config: Config = toml::from_str(&buf)
-            .unwrap_or_else(|_| panic!("Could not parse config file {:?}.", &conf));
-        config
+        f.read_to_string(&mut buf)?;
+        let config: Config = toml::from_str(&buf)?;
+        Ok(config)
     }
 
-    fn test(&self) -> bool {
+    pub fn test(&self) -> bool {
         let mut success = true;
         for rule in &self.rules {
             if let Some(actions) = &rule.action {
@@ -258,68 +235,8 @@ impl Config {
     }
 }
 
-#[derive(StructOpt, Debug)]
-struct Opt {
-    /// Test configuration and exit
-    #[structopt(short = "t", long = "test")]
-    test: bool,
-}
-
-fn init_log() {
-    let mut log = match dirs_next::home_dir() {
-        Some(path) => path,
-        _ => PathBuf::from(""),
-    };
-    log.push("mailproc.log");
-    let logfile = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .expect("Could not open log file");
-    logfile.lock_exclusive().expect("Could not lock log file");
-
-    WriteLogger::init(LevelFilter::Info, LogConfig::default(), logfile)
-        .expect("Could not initialize write logger");
-}
-
-fn main() {
-    std::process::exit(run());
-}
-
-fn run() -> i32 {
-    let opt = Opt::from_args();
-    let config = Config::new();
-
-    init_log();
-
-    if opt.test {
-        let success = config.test();
-        if !success {
-            println!("Config FAIL");
-            return 1;
-        } else {
-            println!("Config OK");
-        }
-        return 0;
-    }
-
-    let mut input_buf = Vec::<u8>::new();
-    match std::io::stdin().read_to_end(&mut input_buf) {
-        Ok(_) => (),
-        Err(e) => {
-            error!("Could not read stdin: {}", e);
-            return 2;
-        }
-    }
-    let parsed_mail = match mailparse::parse_mail(&input_buf) {
-        Ok(m) => m,
-        Err(e) => {
-            error!("Could not parse mail: {}", e);
-            return 3;
-        }
-    };
-
-    info!(
+pub fn handle<'a>(parsed_mail: &ParsedMail, input_buf: &[u8], config: &'a Config) -> Option<(&'a Rule, Vec<u8>)> {
+	info!(
         "Handling mail: From: {}, Subject: {}",
         parsed_mail
             .get_headers()
@@ -331,7 +248,7 @@ fn run() -> i32 {
             .unwrap_or_default(),
     );
 
-    for rule in config.rules {
+    for rule in &config.rules {
         // If there is a filter, then run it and collect the output
         let mut filter_res = match rule.filter {
             None => None,
@@ -370,8 +287,8 @@ fn run() -> i32 {
 
         // Assign the buffer and parsed mail structs to original or filtered values
         let (buffer, parsed) = match (&filter_buffer, &filter_parsed) {
-            (Some(ref b), Some(ref p)) => (b, p),
-            _ => (&input_buf, &parsed_mail),
+            (Some(ref b), Some(ref p)) => (&**b, p),
+            _ => (input_buf, parsed_mail),
         };
 
         // And start the business of matching.
@@ -445,27 +362,8 @@ fn run() -> i32 {
 
         if mail_match.matched() {
             info!("Matched rule: {}", rule);
-            if let Some(ref actions) = rule.action {
-                for action in actions {
-                    info!("Doing action: {}", action.join(" "));
-                    let job = Job::run(&action, Some(&buffer));
-                    info!(
-                        "Result: {}",
-                        match job.subprocess.exit_status() {
-                            Some(Exited(code)) => format!("Exited: {}", code),
-                            Some(Signaled(code)) => format!("Signaled: {}", code),
-                            Some(Other(code)) => format!("Other: {}", code),
-                            Some(Undetermined) => "Undetermined".to_string(),
-                            None => "None".to_string(),
-                        }
-                    );
-                }
-            } else {
-                info!("No action, message dropped");
-            }
-            // break rule processing loop
-            break;
+            return Some((rule, buffer.to_vec()));
         }
     }
-    0
+	None
 }
